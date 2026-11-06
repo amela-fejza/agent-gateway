@@ -172,6 +172,7 @@ class WebSocketAgentServerClient(AgentServerClient):
         self._ws: Any = None
         self._lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
+        self._reconnect_enabled = False
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._server_ready: bool = False
@@ -237,6 +238,14 @@ class WebSocketAgentServerClient(AgentServerClient):
         return self._server_ready
 
     @property
+    def can_reconnect(self) -> bool:
+        """Whether a request can restore the configured transport."""
+        return bool(self._uri) and (
+            self._reconnect_lock.locked()
+            or (self._reconnect_enabled and self._ws is None)
+        )
+
+    @property
     def agent_ready(self) -> bool:
         """Agent Runtime can execute. False while warming or failed."""
         return self._agent_ready
@@ -268,6 +277,9 @@ class WebSocketAgentServerClient(AgentServerClient):
     ) -> None:
         with (trace_operation("gw.agent.ws.connect")
               if current_request_trace() is not None else nullcontext(None)) as operation:
+            # Initial connection and its startup retries own connection setup until
+            # one attempt finishes. Proxy requests must not start another attempt.
+            self._reconnect_enabled = False
             if self._ws is not None:
                 await self.disconnect()
             logger.debug("[WebSocketAgentServerClient] 正在连接: %s", uri)
@@ -351,6 +363,7 @@ class WebSocketAgentServerClient(AgentServerClient):
             self._running = True
             with (bind_request_trace(None) if current_request_trace() is not None else nullcontext()):
                 self._receiver_task = asyncio.create_task(self._message_receiver_loop())
+            self._reconnect_enabled = True
             logger.info("[WebSocketAgentServerClient] 消息接收任务已启动")
 
     async def _message_receiver_loop(self) -> None:
@@ -545,10 +558,9 @@ class WebSocketAgentServerClient(AgentServerClient):
         self._message_queues.clear()
 
         # 关闭 WebSocket
-        if self._ws is None:
-            return
         try:
-            await self._ws.close()
+            if self._ws is not None:
+                await self._ws.close()
         except Exception as e:
             logger.warning(
                 "关闭 AgentServer WebSocket 时异常: %s",
@@ -559,6 +571,7 @@ class WebSocketAgentServerClient(AgentServerClient):
             )
         finally:
             self._ws = None
+            self._reconnect_enabled = False
             self._uri = None
             self._extra_headers = {}
             self._server_ready = False
@@ -571,19 +584,37 @@ class WebSocketAgentServerClient(AgentServerClient):
             raise RuntimeError("未连接 AgentServer，请先调用 connect(uri)")
 
     async def _ensure_connected_for_request(self) -> None:
-        if self._ws is not None:
+        # A reconnect publishes the socket before its acknowledgement arrives.
+        # Other requests must wait until that attempt has finished.
+        if self._ws is not None and not self._reconnect_lock.locked():
             return
-        uri = self._uri
-        if not uri:
-            raise RuntimeError("未连接 AgentServer，请先调用 connect(uri)")
         async with self._reconnect_lock:
             if self._ws is not None:
                 return
+            uri = self._uri
+            if not uri:
+                raise RuntimeError("未连接 AgentServer，请先调用 connect(uri)")
+            headers = dict(self._extra_headers)
+            reconnect_enabled = self._reconnect_enabled
             logger.info(
                 "[WebSocketAgentServerClient] WebSocket 已断开，准备按需重连: %s",
                 format_ws_diagnostics(self._diagnostic_state(), uri=uri),
             )
-            await self.connect(uri, extra_headers=dict(self._extra_headers))
+            try:
+                await self.connect(uri, extra_headers=headers)
+            except (Exception, asyncio.CancelledError):
+                # A request timeout can interrupt the acknowledgement handshake.
+                # Close any partial socket and retain configuration for the next
+                # request; never replay a business request already sent.
+                try:
+                    await self.disconnect()
+                finally:
+                    # Cleanup can itself be cancelled; future requests must not
+                    # lose the last successful connection's retry capability.
+                    self._uri = uri
+                    self._extra_headers = headers
+                    self._reconnect_enabled = reconnect_enabled
+                raise
 
     async def _send_wire_payload(self, payload: dict[str, Any]) -> None:
         ws = self._ws
