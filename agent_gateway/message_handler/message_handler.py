@@ -3959,6 +3959,9 @@ class MessageHandler(ABC):
             chunk, session_id=session_id, metadata=bus_metadata,
             app_id=_push_app_id,
         )
+        # 企业版 cron 执行页只订 /live，不挂会话 WS；send_file 的 chat.file
+        # 若只进 WebChannel 会被丢掉。旁路抄进 CronLiveBus。
+        self._mirror_cron_live_file_push(out)
         await self.publish_robot_messages(out)
         logger.debug(
             "[MessageHandler] server_push 已写入 robot_messages: request_id=%s channel_id=%s app_id=%s",
@@ -4047,6 +4050,40 @@ class MessageHandler(ABC):
 
     def set_cron_controller(self, controller: Any) -> None:
         self._cron_controller = controller
+
+    def _mirror_cron_live_file_push(self, msg: "Message") -> None:
+        """cron 执行会话上的 chat.file / chat.media 抄进 CronLiveBus。"""
+        payload = msg.payload if isinstance(getattr(msg, "payload", None), dict) else {}
+        event = str(
+            payload.get("event_type")
+            or getattr(getattr(msg, "event_type", None), "value", None)
+            or getattr(msg, "event_type", None)
+            or ""
+        ).strip()
+        if event not in ("chat.file", "chat.media"):
+            return
+        sid = str(
+            getattr(msg, "session_id", None) or payload.get("session_id") or ""
+        ).strip()
+        # 不在这里用 cron_/__cron__ 前缀过滤：web「立即执行」的 exec_session_id
+        # 可能是 AgentServer 返回的任意 id；是否属于活跃 cron 跑次由
+        # scheduler.mirror_exec_session_live_event → exec_session_id 精确匹配判定。
+        if not sid:
+            return
+        controller = getattr(self, "_cron_controller", None)
+        scheduler = getattr(controller, "scheduler", None) if controller is not None else None
+        mirror = getattr(scheduler, "mirror_exec_session_live_event", None)
+        if not callable(mirror):
+            return
+        try:
+            mirror(sid, event, payload)
+        except Exception:  # noqa: BLE001 — 直播旁路失败不挡主投递
+            logger.warning(
+                "[MessageHandler] cron live file mirror failed session_id=%s event=%s",
+                sid,
+                event,
+                exc_info=True,
+            )
 
     @staticmethod
     def _is_permission_resume(env: Any, session_id: str | None) -> bool:
